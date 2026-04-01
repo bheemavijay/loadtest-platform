@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: loadtest-backend
+    env: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        sync: false
+      - key: GO_BINARY_PATH
+        sync: false
+      - key: LOADTEST_EXECUTION_TIMEOUT_MS
+        value: "600000"
