@@ -9,7 +9,7 @@ const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
-const GO_BINARY_PATH = process.env.GO_BINARY_PATH || '';
+const GO_BINARY_PATH = process.env.GO_BINARY_PATH || path.resolve(__dirname, '..', '..', 'loadtest');
 const EXECUTION_TIMEOUT_MS = Number.parseInt(process.env.LOADTEST_EXECUTION_TIMEOUT_MS || '600000', 10);
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const NODE_ENV = process.env.NODE_ENV || 'development';
@@ -98,8 +98,8 @@ async function runLoadTest(config) {
 }
 
 function executeLoadTest(configPath, cwd) {
-  const command = GO_BINARY_PATH || 'go';
-  const args = GO_BINARY_PATH ? ['-config', configPath] : ['run', './cmd/loadtest', '-config', configPath];
+  const command = GO_BINARY_PATH;
+  const args = ['-config', configPath];
 
   console.log('Executing load test command:', command, args.join(' '));
 
@@ -331,11 +331,7 @@ function createError(statusCode, publicMessage, details) {
 }
 
 function describeCommand() {
-  if (GO_BINARY_PATH) {
-    return `${GO_BINARY_PATH} -config <temp-config>`;
-  }
-
-  return 'go run ./cmd/loadtest -config <temp-config>';
+  return `${GO_BINARY_PATH} -config <temp-config>`;
 }
 
 function parseStructuredGoError(stderr) {
