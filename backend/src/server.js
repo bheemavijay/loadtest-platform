@@ -1,5 +1,6 @@
 'use strict';
 
+const cors = require('cors');
 const express = require('express');
 const fs = require('fs/promises');
 const os = require('os');
@@ -12,10 +13,17 @@ const GO_BINARY_PATH = process.env.GO_BINARY_PATH || '';
 const EXECUTION_TIMEOUT_MS = Number.parseInt(process.env.LOADTEST_EXECUTION_TIMEOUT_MS || '600000', 10);
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const NODE_ENV = process.env.NODE_ENV || 'development';
+const corsOptions = {
+  origin: ['https://loadtest-platform.vercel.app'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
 
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '1mb' }));
 
 app.get('/healthz', (_req, res) => {
