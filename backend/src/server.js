@@ -179,6 +179,10 @@ function normalizeConfig(payload) {
   }
 
   const config = { ...payload };
+  const finalHeaders =
+    config.headers && typeof config.headers === 'object' && !Array.isArray(config.headers)
+      ? config.headers
+      : {};
 
   if (config.json_body === undefined && config.body !== undefined) {
     config.json_body = config.body;
@@ -207,10 +211,7 @@ function normalizeConfig(payload) {
     }
   }
 
-  if (config.headers === undefined) {
-    config.headers = {};
-  }
-  if (!isSimpleHeadersObject(config.headers)) {
+  if (!isSimpleHeadersObject(finalHeaders)) {
     throw createError(400, 'Config field "headers" must be an object of string values');
   }
 
@@ -247,7 +248,7 @@ function normalizeConfig(payload) {
   return {
     url: config.url.trim(),
     method: config.method || 'GET',
-    headers: config.headers,
+    headers: finalHeaders,
     json_body: config.json_body,
     requests: config.requests,
     concurrency: config.concurrency,

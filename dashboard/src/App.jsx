@@ -54,7 +54,7 @@ function App() {
     setErrorDetails('');
     setSuccessMessage('');
 
-    const parsedHeaders = parseHeaders(form.headers);
+    const parsedHeaders = parseHeaders(form.headers, form.method);
     if (parsedHeaders.error) {
       setError(parsedHeaders.error);
       setIsRunning(false);
@@ -246,7 +246,7 @@ function App() {
                   name="headers"
                   value={form.headers}
                   onChange={handleChange}
-                  placeholder={`Content-Type: application/json\nx-org-id: bm\nx-site-id: bm_dev_001`}
+                  placeholder={`{\n  "Authorization": "Bearer YOUR_TOKEN",\n  "Content-Type": "application/json",\n  "x-org-id": "bm",\n  "x-site-id": "bm_dev_001"\n}`}
                 />
               </FormField>
 
@@ -588,39 +588,38 @@ function formatInteger(value) {
   return new Intl.NumberFormat().format(value);
 }
 
-function parseHeaders(rawHeaders) {
-  const lines = rawHeaders
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines.length === 0) {
-    return { value: undefined };
+function parseHeaders(rawHeaders, method) {
+  const trimmed = rawHeaders.trim();
+  if (!trimmed) {
+    return { value: {} };
   }
 
-  const headers = {};
-
-  for (const line of lines) {
-    const separatorIndex = line.indexOf(':');
-    if (separatorIndex <= 0) {
-      return {
-        error: `Invalid header "${line}". Use the format key:value, one header per line.`
-      };
-    }
-
-    const key = line.slice(0, separatorIndex).trim();
-    const value = line.slice(separatorIndex + 1).trim();
-
-    if (!key || !value) {
-      return {
-        error: `Invalid header "${line}". Both header name and value are required.`
-      };
-    }
-
-    headers[key] = value;
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { error: 'Invalid JSON in headers.' };
   }
 
-  return { value: headers };
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { error: 'Headers must be a JSON object.' };
+  }
+
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== 'string') {
+      return { error: `Header "${key}" must have a string value.` };
+    }
+  }
+
+  if (
+    method === 'POST' &&
+    typeof parsed.Authorization === 'string' &&
+    parsed.Authorization.trim() === ''
+  ) {
+    return { error: 'Authorization header cannot be empty when provided.' };
+  }
+
+  return { value: parsed };
 }
 
 function formatApiError(payload) {
