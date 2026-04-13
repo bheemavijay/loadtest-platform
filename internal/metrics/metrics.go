@@ -16,6 +16,8 @@ type Snapshot struct {
 	Failures       int64
 	Retries        int64
 	TotalLatencyNs int64
+	MinLatencyNs   int64
+	MaxLatencyNs   int64
 	LatenciesNs    []int64
 	Duration       time.Duration
 	StatusCodes    map[int]int64
@@ -35,19 +37,21 @@ type Metrics struct {
 	failures       atomic.Int64
 	retries        atomic.Int64
 	totalLatencyNs atomic.Int64
-	latencyIndex   atomic.Int64
+	minLatencyNs   atomic.Int64
+	maxLatencyNs   atomic.Int64
+	latencyIndex   atomic.Uint64
 	latenciesNs    []int64
 	mu             sync.Mutex
-	statusCodes    map[int]int64
+	statusCodes    [600]atomic.Int64
 	errorSummary   map[string]int64
 	failedSamples  []FailedSample
 }
 
 func New(totalRequests int) *Metrics {
+	sampleSize := min(max(totalRequests, 1), 4096)
 	return &Metrics{
 		totalRequests: int64(totalRequests),
-		latenciesNs:   make([]int64, totalRequests),
-		statusCodes:   make(map[int]int64),
+		latenciesNs:   make([]int64, sampleSize),
 		errorSummary:  make(map[string]int64),
 		failedSamples: make([]FailedSample, 0, min(totalRequests, 25)),
 	}
@@ -57,8 +61,12 @@ func (m *Metrics) Record(latency time.Duration, success bool) {
 	m.completed.Add(1)
 	latencyNs := latency.Nanoseconds()
 	m.totalLatencyNs.Add(latencyNs)
-	if index := m.latencyIndex.Add(1) - 1; index < int64(len(m.latenciesNs)) {
-		m.latenciesNs[index] = latencyNs
+	m.updateMinLatency(latencyNs)
+	m.updateMaxLatency(latencyNs)
+
+	if len(m.latenciesNs) > 0 {
+		index := m.latencyIndex.Add(1) - 1
+		m.latenciesNs[index%uint64(len(m.latenciesNs))] = latencyNs
 	}
 
 	if success {
@@ -71,20 +79,16 @@ func (m *Metrics) Record(latency time.Duration, success bool) {
 
 func (m *Metrics) Snapshot(duration time.Duration) Snapshot {
 	completed := m.completed.Load()
-	if completed > int64(len(m.latenciesNs)) {
-		completed = int64(len(m.latenciesNs))
+	sampleCount := completed
+	if sampleCount > int64(len(m.latenciesNs)) {
+		sampleCount = int64(len(m.latenciesNs))
 	}
 
-	latencies := make([]int64, completed)
-	copy(latencies, m.latenciesNs[:completed])
+	latencies := make([]int64, sampleCount)
+	copy(latencies, m.latenciesNs[:sampleCount])
 	slices.Sort(latencies)
 
 	m.mu.Lock()
-	statusCodes := make(map[int]int64, len(m.statusCodes))
-	for code, count := range m.statusCodes {
-		statusCodes[code] = count
-	}
-
 	errorSummary := make(map[string]int64, len(m.errorSummary))
 	for key, count := range m.errorSummary {
 		errorSummary[key] = count
@@ -94,6 +98,13 @@ func (m *Metrics) Snapshot(duration time.Duration) Snapshot {
 	copy(failedSamples, m.failedSamples)
 	m.mu.Unlock()
 
+	statusCodes := make(map[int]int64)
+	for code := range m.statusCodes {
+		if count := m.statusCodes[code].Load(); count > 0 {
+			statusCodes[code] = count
+		}
+	}
+
 	return Snapshot{
 		TotalRequests:  m.totalRequests,
 		Completed:      completed,
@@ -101,6 +112,8 @@ func (m *Metrics) Snapshot(duration time.Duration) Snapshot {
 		Failures:       m.failures.Load(),
 		Retries:        m.retries.Load(),
 		TotalLatencyNs: m.totalLatencyNs.Load(),
+		MinLatencyNs:   m.minLatencyNs.Load(),
+		MaxLatencyNs:   m.maxLatencyNs.Load(),
 		LatenciesNs:    latencies,
 		Duration:       duration,
 		StatusCodes:    statusCodes,
@@ -118,21 +131,19 @@ func (m *Metrics) AddRetries(count int) {
 }
 
 func (m *Metrics) RecordStatusCode(statusCode int) {
-	if statusCode == 0 {
+	if statusCode <= 0 || statusCode >= len(m.statusCodes) {
 		return
 	}
 
-	m.mu.Lock()
-	m.statusCodes[statusCode]++
-	m.mu.Unlock()
+	m.statusCodes[statusCode].Add(1)
 }
 
 func (m *Metrics) RecordFailure(statusCode int, errMsg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if statusCode != 0 {
-		m.statusCodes[statusCode]++
+	if statusCode > 0 && statusCode < len(m.statusCodes) {
+		m.statusCodes[statusCode].Add(1)
 	}
 
 	if errMsg != "" {
@@ -153,6 +164,14 @@ func (s Snapshot) AverageLatency() time.Duration {
 	}
 
 	return time.Duration(s.TotalLatencyNs / s.Completed)
+}
+
+func (s Snapshot) MinLatency() time.Duration {
+	return time.Duration(s.MinLatencyNs)
+}
+
+func (s Snapshot) MaxLatency() time.Duration {
+	return time.Duration(s.MaxLatencyNs)
 }
 
 func (s Snapshot) Throughput() float64 {
@@ -226,7 +245,9 @@ func (s Snapshot) Report() string {
 	report.WriteString(formatRow("Retry Attempts", fmt.Sprintf("%d", s.Retries)))
 	report.WriteByte('\n')
 	report.WriteString(fmt.Sprintf("%sLatency%s\n", colorBold, colorReset))
+	report.WriteString(formatRow("Min", s.MinLatency().Round(time.Microsecond).String()))
 	report.WriteString(formatRow("Average", s.AverageLatency().Round(time.Microsecond).String()))
+	report.WriteString(formatRow("Max", s.MaxLatency().Round(time.Microsecond).String()))
 	report.WriteString(formatRow("P50", s.Percentile(50).Round(time.Microsecond).String()))
 	report.WriteString(formatRow("P90", s.Percentile(90).Round(time.Microsecond).String()))
 	report.WriteString(formatRow("P95", s.Percentile(95).Round(time.Microsecond).String()))
@@ -293,4 +314,36 @@ func min(a, b int) int {
 	}
 
 	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+
+	return b
+}
+
+func (m *Metrics) updateMinLatency(latencyNs int64) {
+	for {
+		current := m.minLatencyNs.Load()
+		if current != 0 && latencyNs >= current {
+			return
+		}
+		if m.minLatencyNs.CompareAndSwap(current, latencyNs) {
+			return
+		}
+	}
+}
+
+func (m *Metrics) updateMaxLatency(latencyNs int64) {
+	for {
+		current := m.maxLatencyNs.Load()
+		if latencyNs <= current {
+			return
+		}
+		if m.maxLatencyNs.CompareAndSwap(current, latencyNs) {
+			return
+		}
+	}
 }

@@ -13,6 +13,8 @@ const GO_BINARY_PATH = process.env.GO_BINARY_PATH || path.resolve(__dirname, '..
 const EXECUTION_TIMEOUT_MS = Number.parseInt(process.env.LOADTEST_EXECUTION_TIMEOUT_MS || '600000', 10);
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const NODE_ENV = process.env.NODE_ENV || 'development';
+const MAX_CONCURRENT_TESTS = 2;
+let activeLoadTests = 0;
 const corsOptions = {
   origin: ['https://loadtest-platform.vercel.app'],
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -34,6 +36,17 @@ app.get('/healthz', (_req, res) => {
 });
 
 app.post('/run-test', async (req, res) => {
+  if (activeLoadTests >= MAX_CONCURRENT_TESTS) {
+    res.status(429).json({
+      status: 'failed',
+      error: 'Too many load tests are already running',
+      details: `Only ${MAX_CONCURRENT_TESTS} concurrent load tests are allowed`
+    });
+    return;
+  }
+
+  activeLoadTests++;
+
   try {
     const config = normalizeConfig(req.body);
     console.log('Final load test config:', JSON.stringify(config, null, 2));
@@ -49,7 +62,10 @@ app.post('/run-test', async (req, res) => {
       error: error.publicMessage || 'Failed to run load test',
       details: error.details || undefined
     });
-  }
+  } finally {
+      activeLoadTests = Math.max(0, activeLoadTests - 1);
+      console.log(`Active load tests: ${activeLoadTests}`);
+    }
 });
 
 app.use((err, _req, res, _next) => {
@@ -196,6 +212,10 @@ function normalizeConfig(payload) {
     config.warmup = config.warmup_duration;
   }
 
+  if (config.rampUp === undefined && config.ramp_up !== undefined) {
+    config.rampUp = config.ramp_up;
+  }
+
   if (typeof config.url !== 'string' || config.url.trim() === '') {
     throw createError(400, 'Config field "url" is required');
   }
@@ -231,11 +251,14 @@ function normalizeConfig(payload) {
 
   validateIntegerField(config, 'requests');
   validateIntegerField(config, 'concurrency');
+  validateIntegerField(config, 'duration');
+  validateIntegerField(config, 'rampUp');
+  validateIntegerField(config, 'loops');
+  validateIntegerField(config, 'request_timeout');
   validateIntegerField(config, 'rps');
   validateIntegerField(config, 'retries');
 
   validateOptionalString(config, 'warmup');
-  validateOptionalString(config, 'request_timeout');
 
   if (config.requests === undefined) {
     throw createError(400, 'Config field "requests" is required');
@@ -245,6 +268,30 @@ function normalizeConfig(payload) {
     throw createError(400, 'Config field "concurrency" is required');
   }
 
+  if (config.concurrency <= 0) {
+    throw createError(400, 'Config field "concurrency" must be greater than zero');
+  }
+
+  if ((config.duration ?? 0) < 0) {
+    throw createError(400, 'Config field "duration" must be zero or greater');
+  }
+
+  if ((config.rampUp ?? 0) < 0) {
+    throw createError(400, 'Config field "rampUp" must be zero or greater');
+  }
+
+  if ((config.loops ?? 0) < 0) {
+    throw createError(400, 'Config field "loops" must be zero or greater');
+  }
+
+  if ((config.request_timeout ?? 0) < 0) {
+    throw createError(400, 'Config field "request_timeout" must be zero or greater');
+  }
+
+  if ((config.duration ?? 0) > 0 && (config.rampUp ?? 0) > (config.duration ?? 0)) {
+    throw createError(400, 'Config field "rampUp" must be less than or equal to duration');
+  }
+
   return {
     url: config.url.trim(),
     method: config.method || 'GET',
@@ -252,10 +299,13 @@ function normalizeConfig(payload) {
     json_body: config.json_body,
     requests: config.requests,
     concurrency: config.concurrency,
+    duration: config.duration ?? 0,
+    rampUp: config.rampUp ?? 0,
+    loops: config.loops ?? 0,
+    request_timeout: config.request_timeout ?? 5,
     rps: config.rps ?? 0,
     retries: config.retries ?? 0,
     warmup: config.warmup || '5s',
-    request_timeout: config.request_timeout
   };
 }
 

@@ -1,10 +1,10 @@
 package generator
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	// Using math/rand for high-performance non-crypto random generation.
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
@@ -127,45 +127,23 @@ func resolvePlaceholder(token string) string {
 }
 
 func randomUUID() string {
-	var bytes [16]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		return fallbackUUID()
-	}
+	high := rand.Uint64()
+	low := rand.Uint64()
 
-	bytes[6] = (bytes[6] & 0x0f) | 0x40
-	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	timeLow := uint32(high >> 32)
+	timeMid := uint16((high >> 16) & 0xffff)
+	timeHiAndVersion := uint16(high&0x0fff) | 0x4000
+	clockSeq := uint16((low >> 48) & 0x3fff)
+	clockSeq = clockSeq | 0x8000
+	node := low & 0x0000ffffffffffff
 
-	return fmt.Sprintf(
-		"%s-%s-%s-%s-%s",
-		hex.EncodeToString(bytes[0:4]),
-		hex.EncodeToString(bytes[4:6]),
-		hex.EncodeToString(bytes[6:8]),
-		hex.EncodeToString(bytes[8:10]),
-		hex.EncodeToString(bytes[10:16]),
-	)
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", timeLow, timeMid, timeHiAndVersion, clockSeq, node)
 }
 
 func randomIPv4() string {
-	var bytes [2]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		now := time.Now().UnixNano()
-		return fmt.Sprintf("192.168.%d.%d", now%255, (now/255)%255)
-	}
-
-	return fmt.Sprintf("192.168.%d.%d", bytes[0], bytes[1])
+	return fmt.Sprintf("192.168.%d.%d", rand.UintN(256), rand.UintN(256))
 }
 
 func randomUint32() uint32 {
-	var bytes [4]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		return uint32(time.Now().UnixNano())
-	}
-
-	return uint32(bytes[0])<<24 | uint32(bytes[1])<<16 | uint32(bytes[2])<<8 | uint32(bytes[3])
-}
-
-func fallbackUUID() string {
-	now := time.Now().UnixNano()
-	hexNow := fmt.Sprintf("%032x", now)
-	return fmt.Sprintf("%s-%s-%s-%s-%s", hexNow[0:8], hexNow[8:12], "4000", "8000", hexNow[16:28])
+	return rand.Uint32()
 }

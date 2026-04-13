@@ -17,6 +17,9 @@ const initialForm = {
   method: 'GET',
   requests: 1000,
   concurrency: 50,
+  duration: 0,
+  rampUp: 0,
+  requestTimeout: 5,
   rps: 0,
   retries: 0,
   body: '',
@@ -43,7 +46,7 @@ function App() {
     const { name, value } = event.target;
     setForm((current) => ({
       ...current,
-      [name]: ['requests', 'concurrency', 'rps', 'retries'].includes(name) ? Number(value) : value
+      [name]: ['requests', 'concurrency', 'duration', 'rampUp', 'requestTimeout', 'rps', 'retries'].includes(name) ? Number(value) : value
     }));
   };
 
@@ -73,6 +76,18 @@ function App() {
       }
     }
 
+    if (form.duration > 0 && form.rampUp > form.duration) {
+      setError('Ramp-up must be less than or equal to duration.');
+      setIsRunning(false);
+      return;
+    }
+
+    if (form.requestTimeout <= 0) {
+      setError('Request timeout must be greater than zero.');
+      setIsRunning(false);
+      return;
+    }
+
     try {
       const response = await fetch(`${apiBaseUrl}/run-test`, {
         method: 'POST',
@@ -86,6 +101,9 @@ function App() {
           json_body: parsedJsonBody,
           requests: form.requests,
           concurrency: form.concurrency,
+          duration: form.duration,
+          rampUp: form.rampUp,
+          request_timeout: form.requestTimeout,
           rps: form.rps,
           retries: form.retries,
           warmup: form.warmup
@@ -229,6 +247,40 @@ function App() {
                 </FormField>
               </div>
 
+              <div className="grid gap-5 sm:grid-cols-2">
+                <FormField label="Duration (Seconds)">
+                  <input
+                    className={inputClass}
+                    type="number"
+                    min="0"
+                    name="duration"
+                    value={form.duration}
+                    onChange={handleChange}
+                  />
+                </FormField>
+                <FormField label="Ramp-Up (Seconds)">
+                  <input
+                    className={inputClass}
+                    type="number"
+                    min="0"
+                    name="rampUp"
+                    value={form.rampUp}
+                    onChange={handleChange}
+                  />
+                </FormField>
+              </div>
+
+              <FormField label="Request Timeout (Seconds)">
+                <input
+                  className={inputClass}
+                  type="number"
+                  min="1"
+                  name="requestTimeout"
+                  value={form.requestTimeout}
+                  onChange={handleChange}
+                />
+              </FormField>
+
               <FormField label="Retries">
                 <input
                   className={inputClass}
@@ -240,7 +292,7 @@ function App() {
                 />
               </FormField>
 
-              <FormField label="Headers">
+              <FormField label="Headers (JSON)">
                 <textarea
                   className={`${inputClass} min-h-32 resize-y`}
                   name="headers"
@@ -267,6 +319,13 @@ function App() {
               >
                 {isRunning ? 'Running test...' : 'Start Test'}
               </button>
+
+              {isRunning && form.duration > 0 ? (
+                <div className="rounded-2xl border border-aqua/20 bg-aqua/10 px-4 py-3 text-sm font-medium text-cyan-100">
+                  Running for {form.duration} seconds
+                  {form.rampUp > 0 ? ` with ${form.rampUp}s ramp-up` : ''}
+                </div>
+              ) : null}
 
               {error ? (
                 <div className="rounded-2xl border border-coral/30 bg-coral/10 px-4 py-3 text-sm font-medium text-rose-100 shadow-inner shadow-coral/10">
@@ -408,8 +467,8 @@ function App() {
                     <DetailRow
                       label="Requests"
                       value={
-                        runResult?.results?.configuration?.total_requests
-                          ? formatInteger(runResult.results.configuration.total_requests)
+                        runResult?.results?.configuration?.requests
+                          ? formatInteger(runResult.results.configuration.requests)
                           : '--'
                       }
                     />

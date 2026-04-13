@@ -11,6 +11,7 @@ import (
 
 	"loadtest/internal/generator"
 	"loadtest/internal/metrics"
+	"golang.org/x/time/rate"
 )
 
 type RequestConfig struct {
@@ -18,12 +19,16 @@ type RequestConfig struct {
 	URL     string
 	Headers http.Header
 	Body    []byte
+	Duration time.Duration
+	RampUp  time.Duration
+	Loops   int
+	RequestTimeout time.Duration
 	RPS     int
 	Retries int
 }
 
 type RateLimiter struct {
-	tokens <-chan time.Time
+	limiter *rate.Limiter
 }
 
 type Engine struct {
@@ -45,6 +50,10 @@ func New(client *http.Client, metrics *metrics.Metrics) *Engine {
 }
 
 func (e *Engine) Run(ctx context.Context, requestConfig RequestConfig, totalRequests, concurrency int) error {
+	if requestConfig.Duration > 0 {
+		return e.runTimedRequests(ctx, requestConfig, concurrency, true)
+	}
+
 	return e.runRequests(ctx, requestConfig, totalRequests, concurrency, true)
 }
 
@@ -77,8 +86,15 @@ func (e *Engine) runWorkerWithMode(ctx context.Context, requestConfig RequestCon
 				return
 			}
 
+			reqCtx := ctx
+			cancel := func() {}
+			if requestConfig.RequestTimeout > 0 {
+				reqCtx, cancel = context.WithTimeout(ctx, requestConfig.RequestTimeout)
+			}
+
 			start := time.Now()
-			success, retries := e.doRequest(ctx, requestConfig)
+			success, retries := e.doRequest(reqCtx, requestConfig)
+			cancel()
 			if recordMetrics && e.metrics != nil {
 				e.metrics.AddRetries(retries)
 			}
@@ -86,6 +102,41 @@ func (e *Engine) runWorkerWithMode(ctx context.Context, requestConfig RequestCon
 				e.metrics.Record(time.Since(start), success)
 			}
 		}
+	}
+}
+
+func (e *Engine) runTimedWorker(ctx context.Context, requestConfig RequestConfig, limiter *RateLimiter, recordMetrics bool) {
+	requestsSent := 0
+
+	for {
+		if requestConfig.Loops > 0 && requestsSent >= requestConfig.Loops {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if err := limiter.Wait(ctx); err != nil {
+			return
+		}
+
+		reqCtx := ctx
+		cancel := func() {}
+		if requestConfig.RequestTimeout > 0 {
+			reqCtx, cancel = context.WithTimeout(ctx, requestConfig.RequestTimeout)
+		}
+
+		start := time.Now()
+		success, retries := e.doRequest(reqCtx, requestConfig)
+		cancel()
+		if recordMetrics && e.metrics != nil {
+			e.metrics.AddRetries(retries)
+			e.metrics.Record(time.Since(start), success)
+		}
+		requestsSent++
 	}
 }
 
@@ -163,61 +214,33 @@ func (e *Engine) recordRequestResult(result RequestResult) {
 	e.metrics.RecordFailure(result.StatusCode, result.Error)
 }
 
-func NewRateLimiter(ctx context.Context, concurrency, rps int) (*RateLimiter, error) {
+func NewRateLimiter(concurrency, rps int) (*RateLimiter, error) {
 	if rps <= 0 {
 		return &RateLimiter{}, nil
 	}
 
-	if rps > int(time.Second) {
-		return nil, fmt.Errorf("rps must be less than or equal to %d", int(time.Second))
-	}
+	// burst = concurrency to allow workers to consume tokens immediately.
+	burst := maxInt(concurrency, 1)
+	fmt.Printf("RateLimiter initialized: RPS=%d, Burst=%d\n", rps, burst)
 
-	interval := time.Second / time.Duration(rps)
-	ticker := time.NewTicker(interval)
-	tokens := make(chan time.Time, maxInt(concurrency, 1))
-
-	go func() {
-		defer ticker.Stop()
-		defer close(tokens)
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case tick := <-ticker.C:
-				select {
-				case tokens <- tick:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
-
-	return &RateLimiter{tokens: tokens}, nil
+	return &RateLimiter{
+		limiter: rate.NewLimiter(rate.Limit(rps), burst),
+	}, nil
 }
 
 func (r *RateLimiter) Wait(ctx context.Context) error {
-	if r == nil || r.tokens == nil {
+	if r == nil || r.limiter == nil {
 		return nil
 	}
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case _, ok := <-r.tokens:
-		if !ok {
-			return ctx.Err()
-		}
-		return nil
-	}
+	return r.limiter.Wait(ctx)
 }
 
 func (e *Engine) runRequests(ctx context.Context, requestConfig RequestConfig, totalRequests, concurrency int, recordMetrics bool) error {
 	jobs := make(chan struct{})
 	var wg sync.WaitGroup
 
-	limiter, err := NewRateLimiter(ctx, concurrency, requestConfig.RPS)
+	limiter, err := NewRateLimiter(concurrency, requestConfig.RPS)
 	if err != nil {
 		return err
 	}
@@ -249,7 +272,7 @@ func (e *Engine) runUntilCanceled(ctx context.Context, requestConfig RequestConf
 	jobs := make(chan struct{}, maxInt(concurrency, 1))
 	var wg sync.WaitGroup
 
-	limiter, err := NewRateLimiter(ctx, concurrency, requestConfig.RPS)
+	limiter, err := NewRateLimiter(concurrency, requestConfig.RPS)
 	if err != nil {
 		return err
 	}
@@ -274,6 +297,61 @@ func (e *Engine) runUntilCanceled(ctx context.Context, requestConfig RequestConf
 		case jobs <- struct{}{}:
 		}
 	}
+}
+
+func (e *Engine) runTimedRequests(ctx context.Context, requestConfig RequestConfig, concurrency int, recordMetrics bool) error {
+	deadline := time.Now().Add(requestConfig.Duration)
+	runCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	limiter, err := NewRateLimiter(concurrency, requestConfig.RPS)
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+
+	if requestConfig.RampUp > 0 {
+		interval := requestConfig.RampUp / time.Duration(concurrency)
+		for workerIndex := 0; workerIndex < concurrency; workerIndex++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				e.runTimedWorker(runCtx, requestConfig, limiter, recordMetrics)
+			}()
+
+			if workerIndex == concurrency-1 || interval <= 0 {
+				continue
+			}
+
+			timer := time.NewTimer(interval)
+			select {
+			case <-runCtx.Done():
+				timer.Stop()
+				wg.Wait()
+				if err := runCtx.Err(); err != nil && err != context.DeadlineExceeded && err != context.Canceled {
+					return err
+				}
+				return nil
+			case <-timer.C:
+			}
+		}
+	} else {
+		for range concurrency {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				e.runTimedWorker(runCtx, requestConfig, limiter, recordMetrics)
+			}()
+		}
+	}
+
+	wg.Wait()
+	if err := runCtx.Err(); err != nil && err != context.DeadlineExceeded && err != context.Canceled {
+		return err
+	}
+
+	return nil
 }
 
 func maxInt(a, b int) int {

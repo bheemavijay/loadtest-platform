@@ -31,13 +31,17 @@ func main() {
 		Transport: newTransport(cfg.Concurrency),
 	}
 
-	loadMetrics := metrics.New(cfg.TotalRequests)
+	loadMetrics := metrics.New(estimatedMetricCapacity(cfg))
 	engine := worker.New(client, loadMetrics)
 	requestConfig := worker.RequestConfig{
 		Method:  cfg.Method,
 		URL:     cfg.URL,
 		Headers: cfg.Headers,
 		Body:    []byte(cfg.JSONBody),
+		Duration: cfg.Duration,
+		RampUp:  cfg.RampUp,
+		Loops:   cfg.Loops,
+		RequestTimeout: cfg.RequestTimeout,
 		RPS:     cfg.RPS,
 		Retries: cfg.Retries,
 	}
@@ -73,6 +77,9 @@ type config struct {
 	Method         string
 	Headers        http.Header
 	JSONBody       string
+	Duration       time.Duration
+	RampUp         time.Duration
+	Loops          int
 	RPS            int
 	Retries        int
 	WarmupDuration time.Duration
@@ -106,6 +113,9 @@ func parseConfig() (config, error) {
 	fs.StringVar(&cfg.Method, "method", cfg.Method, "HTTP method to use: GET or POST")
 	fs.Var(headerFlags, "header", "Custom header in 'Key: Value' format; repeat flag for multiple headers")
 	fs.StringVar(&cfg.JSONBody, "body", cfg.JSONBody, "JSON request body for POST requests")
+	fs.DurationVar(&cfg.Duration, "duration", cfg.Duration, "Time-based execution duration; when set, duration mode is used")
+	fs.DurationVar(&cfg.RampUp, "ramp-up", cfg.RampUp, "Duration used to ramp up workers in time-based mode")
+	fs.IntVar(&cfg.Loops, "loops", cfg.Loops, "Optional maximum request loops per worker in duration mode")
 	fs.IntVar(&cfg.RPS, "rps", cfg.RPS, "Target requests per second; 0 disables rate limiting")
 	fs.IntVar(&cfg.Retries, "retries", cfg.Retries, "Number of retry attempts for failed requests")
 	fs.DurationVar(&cfg.WarmupDuration, "warmup", cfg.WarmupDuration, "Warm-up duration before metrics collection; 0 disables warm-up")
@@ -135,15 +145,15 @@ func parseConfig() (config, error) {
 		return cfg, fmt.Errorf("method must be GET or POST")
 	}
 
-	if cfg.TotalRequests <= 0 {
-		return cfg, fmt.Errorf("requests must be greater than zero")
+	if cfg.TotalRequests <= 0 && cfg.Duration <= 0 {
+		return cfg, fmt.Errorf("requests must be greater than zero when duration is not set")
 	}
 
 	if cfg.Concurrency <= 0 {
 		return cfg, fmt.Errorf("concurrency must be greater than zero")
 	}
 
-	if cfg.Concurrency > cfg.TotalRequests {
+	if cfg.Duration <= 0 && cfg.Concurrency > cfg.TotalRequests {
 		cfg.Concurrency = cfg.TotalRequests
 	}
 
@@ -157,6 +167,18 @@ func parseConfig() (config, error) {
 
 	if cfg.Retries < 0 {
 		return cfg, fmt.Errorf("retries must be zero or greater")
+	}
+
+	if cfg.Duration < 0 {
+		return cfg, fmt.Errorf("duration must be zero or greater")
+	}
+
+	if cfg.RampUp < 0 {
+		return cfg, fmt.Errorf("ramp-up must be zero or greater")
+	}
+
+	if cfg.Loops < 0 {
+		return cfg, fmt.Errorf("loops must be zero or greater")
 	}
 
 	if cfg.WarmupDuration < 0 {
@@ -265,6 +287,15 @@ func loadConfigFile(path string) (config, error) {
 	} else if raw.LegacyBody != "" {
 		cfg.JSONBody = raw.LegacyBody
 	}
+	if raw.Duration > 0 {
+		cfg.Duration = time.Duration(raw.Duration) * time.Second
+	}
+	if raw.RampUp > 0 {
+		cfg.RampUp = time.Duration(raw.RampUp) * time.Second
+	}
+	if raw.Loops != nil {
+		cfg.Loops = *raw.Loops
+	}
 	if raw.RPS != nil {
 		cfg.RPS = *raw.RPS
 	}
@@ -296,12 +327,12 @@ func loadConfigFile(path string) (config, error) {
 		cfg.WarmupDuration = duration
 	}
 
-	if raw.RequestTimeout != "" {
-		duration, err := time.ParseDuration(raw.RequestTimeout)
+	if raw.RequestTimeout != nil {
+		timeout, err := parseRequestTimeout(raw.RequestTimeout)
 		if err != nil {
-			return cfg, fmt.Errorf("invalid timeout duration: %w", err)
+			return cfg, err
 		}
-		cfg.RequestTimeout = duration
+		cfg.RequestTimeout = timeout
 	}
 
 	return cfg, nil
@@ -314,6 +345,9 @@ type configFile struct {
 	LegacyHeaders  map[string][]string `json:"legacy_headers" yaml:"legacy_headers"`
 	JSONBody       any                 `json:"json_body" yaml:"json_body"`
 	LegacyBody     string              `json:"body" yaml:"body"`
+	Duration       int                 `json:"duration" yaml:"duration"`
+	RampUp         int                 `json:"rampUp" yaml:"rampUp"`
+	Loops          *int                `json:"loops" yaml:"loops"`
 	RPS            *int                `json:"rps" yaml:"rps"`
 	Retries        *int                `json:"retries" yaml:"retries"`
 	WarmupDuration string              `json:"warmup" yaml:"warmup"`
@@ -321,7 +355,7 @@ type configFile struct {
 	TotalRequests  *int                `json:"requests" yaml:"requests"`
 	LegacyRequests *int                `json:"total_requests" yaml:"total_requests"`
 	Concurrency    *int                `json:"concurrency" yaml:"concurrency"`
-	RequestTimeout string              `json:"request_timeout" yaml:"request_timeout"`
+	RequestTimeout any                 `json:"request_timeout" yaml:"request_timeout"`
 	Output         *string             `json:"output" yaml:"output"`
 }
 
@@ -337,6 +371,9 @@ type exportConfig struct {
 	JSONBody       any                 `json:"json_body,omitempty"`
 	TotalRequests  int                 `json:"requests"`
 	Concurrency    int                 `json:"concurrency"`
+	Duration       int                 `json:"duration,omitempty"`
+	RampUp         int                 `json:"rampUp,omitempty"`
+	Loops          int                 `json:"loops,omitempty"`
 	RPS            int                 `json:"rps"`
 	Retries        int                 `json:"retries"`
 	WarmupDuration string              `json:"warmup"`
@@ -373,6 +410,9 @@ func exportResults(cfg config, snapshot metrics.Snapshot) error {
 			JSONBody:       parseJSONBody(cfg.JSONBody),
 			TotalRequests:  cfg.TotalRequests,
 			Concurrency:    cfg.Concurrency,
+			Duration:       int(cfg.Duration / time.Second),
+			RampUp:         int(cfg.RampUp / time.Second),
+			Loops:          cfg.Loops,
 			RPS:            cfg.RPS,
 			Retries:        cfg.Retries,
 			WarmupDuration: cfg.WarmupDuration.String(),
@@ -468,6 +508,44 @@ func parseJSONBody(body string) any {
 	}
 
 	return parsed
+}
+
+func parseRequestTimeout(value any) (time.Duration, error) {
+	switch typed := value.(type) {
+	case string:
+		if typed == "" {
+			return 0, nil
+		}
+		duration, err := time.ParseDuration(typed)
+		if err != nil {
+			return 0, fmt.Errorf("invalid timeout duration: %w", err)
+		}
+		return duration, nil
+	case int:
+		return time.Duration(typed) * time.Second, nil
+	case int64:
+		return time.Duration(typed) * time.Second, nil
+	case float64:
+		return time.Duration(int(typed)) * time.Second, nil
+	default:
+		return 0, fmt.Errorf("invalid timeout duration type %T", value)
+	}
+}
+
+func estimatedMetricCapacity(cfg config) int {
+	if cfg.TotalRequests > 0 {
+		return cfg.TotalRequests
+	}
+
+	if cfg.Duration > 0 && cfg.RPS > 0 {
+		return max(int(cfg.Duration/time.Second)*cfg.RPS, cfg.Concurrency)
+	}
+
+	if cfg.Duration > 0 && cfg.Loops > 0 {
+		return max(cfg.Concurrency*cfg.Loops, cfg.Concurrency)
+	}
+
+	return max(cfg.Concurrency*10, 1)
 }
 
 func normalizeMethod(method string) string {
