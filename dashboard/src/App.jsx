@@ -89,33 +89,38 @@ function App() {
     }
 
     try {
+      const payload = {
+        url: form.url,
+        method: form.method,
+        headers: parsedHeaders.value ?? {},
+        requests: form.requests,
+        concurrency: form.concurrency,
+        duration: form.duration,
+        rampUp: form.rampUp,
+        request_timeout: form.requestTimeout,
+        rps: form.rps,
+        retries: form.retries,
+        warmup: form.warmup
+      };
+
+      if (form.method === 'POST' && parsedJsonBody !== undefined) {
+        payload.json_body = parsedJsonBody;
+      }
+
       const response = await fetch(`${apiBaseUrl}/run-test`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          url: form.url,
-          method: form.method,
-          headers: parsedHeaders.value ?? {},
-          json_body: parsedJsonBody,
-          requests: form.requests,
-          concurrency: form.concurrency,
-          duration: form.duration,
-          rampUp: form.rampUp,
-          request_timeout: form.requestTimeout,
-          rps: form.rps,
-          retries: form.retries,
-          warmup: form.warmup
-        })
+        body: JSON.stringify(payload)
       });
 
-      const payload = await response.json();
+      const responsePayload = await response.json();
       if (!response.ok) {
-        throw new Error(formatApiError(payload));
+        throw new Error(formatApiError(responsePayload));
       }
 
-      setRunResult(payload);
+      setRunResult(responsePayload);
       setSuccessMessage('Load test completed successfully. Metrics have been refreshed.');
     } catch (submitError) {
       const { message, details } = parseUiError(submitError);

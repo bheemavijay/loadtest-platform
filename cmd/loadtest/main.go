@@ -327,12 +327,8 @@ func loadConfigFile(path string) (config, error) {
 		cfg.WarmupDuration = duration
 	}
 
-	if raw.RequestTimeout != nil {
-		timeout, err := parseRequestTimeout(raw.RequestTimeout)
-		if err != nil {
-			return cfg, err
-		}
-		cfg.RequestTimeout = timeout
+	if raw.RequestTimeout > 0 {
+		cfg.RequestTimeout = time.Duration(raw.RequestTimeout) * time.Second
 	}
 
 	return cfg, nil
@@ -355,7 +351,7 @@ type configFile struct {
 	TotalRequests  *int                `json:"requests" yaml:"requests"`
 	LegacyRequests *int                `json:"total_requests" yaml:"total_requests"`
 	Concurrency    *int                `json:"concurrency" yaml:"concurrency"`
-	RequestTimeout any                 `json:"request_timeout" yaml:"request_timeout"`
+	RequestTimeout int                 `json:"request_timeout" yaml:"request_timeout"`
 	Output         *string             `json:"output" yaml:"output"`
 }
 
@@ -377,7 +373,7 @@ type exportConfig struct {
 	RPS            int                 `json:"rps"`
 	Retries        int                 `json:"retries"`
 	WarmupDuration string              `json:"warmup"`
-	RequestTimeout string              `json:"request_timeout"`
+	RequestTimeout int                 `json:"request_timeout"`
 }
 
 type exportMetrics struct {
@@ -416,7 +412,7 @@ func exportResults(cfg config, snapshot metrics.Snapshot) error {
 			RPS:            cfg.RPS,
 			Retries:        cfg.Retries,
 			WarmupDuration: cfg.WarmupDuration.String(),
-			RequestTimeout: cfg.RequestTimeout.String(),
+			RequestTimeout: int(cfg.RequestTimeout / time.Second),
 		},
 		Metrics: exportMetrics{
 			TotalRequests:          snapshot.TotalRequests,
@@ -508,28 +504,6 @@ func parseJSONBody(body string) any {
 	}
 
 	return parsed
-}
-
-func parseRequestTimeout(value any) (time.Duration, error) {
-	switch typed := value.(type) {
-	case string:
-		if typed == "" {
-			return 0, nil
-		}
-		duration, err := time.ParseDuration(typed)
-		if err != nil {
-			return 0, fmt.Errorf("invalid timeout duration: %w", err)
-		}
-		return duration, nil
-	case int:
-		return time.Duration(typed) * time.Second, nil
-	case int64:
-		return time.Duration(typed) * time.Second, nil
-	case float64:
-		return time.Duration(int(typed)) * time.Second, nil
-	default:
-		return 0, fmt.Errorf("invalid timeout duration type %T", value)
-	}
 }
 
 func estimatedMetricCapacity(cfg config) int {

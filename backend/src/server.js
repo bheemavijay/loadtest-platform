@@ -9,7 +9,8 @@ const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
-const GO_BINARY_PATH = process.env.GO_BINARY_PATH || path.resolve(__dirname, '..', '..', 'loadtest');
+const DEFAULT_BINARY_NAME = process.platform === 'win32' ? 'loadtest.exe' : 'loadtest';
+const GO_BINARY_PATH = process.env.GO_BINARY_PATH || path.resolve(__dirname, '..', '..', DEFAULT_BINARY_NAME);
 const EXECUTION_TIMEOUT_MS = Number.parseInt(process.env.LOADTEST_EXECUTION_TIMEOUT_MS || '600000', 10);
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const NODE_ENV = process.env.NODE_ENV || 'development';
@@ -50,6 +51,11 @@ app.post('/run-test', async (req, res) => {
   try {
     const config = normalizeConfig(req.body);
     console.log('Final load test config:', JSON.stringify(config, null, 2));
+    if (config.rps > 0) {
+      console.log('Running in RPS mode');
+    } else {
+      console.log('Running in fixed request mode');
+    }
     const result = await runLoadTest(config);
     res.status(200).json({
       status: 'success',
@@ -235,9 +241,6 @@ function normalizeConfig(payload) {
     throw createError(400, 'Config field "headers" must be an object of string values');
   }
 
-  if (config.json_body === undefined) {
-    config.json_body = {};
-  }
   if (typeof config.json_body === 'string') {
     try {
       config.json_body = JSON.parse(config.json_body);
@@ -245,7 +248,13 @@ function normalizeConfig(payload) {
       throw createError(400, 'Config field "json_body" must be valid JSON', error.message);
     }
   }
-  if (!isPlainObject(config.json_body)) {
+
+  const normalizedMethod = config.method || 'GET';
+  if (normalizedMethod === 'GET' && config.json_body !== undefined) {
+    throw createError(400, 'GET request should not include body');
+  }
+
+  if (config.json_body !== undefined && !isPlainObject(config.json_body)) {
     throw createError(400, 'Config field "json_body" must be a JSON object');
   }
 
@@ -262,6 +271,10 @@ function normalizeConfig(payload) {
 
   if (config.requests === undefined) {
     throw createError(400, 'Config field "requests" is required');
+  }
+
+  if ((config.rps ?? 0) > 0 && (config.requests ?? 0) > 0) {
+    throw createError(400, "Use either 'requests' OR 'rps', not both");
   }
 
   if (config.concurrency === undefined) {
@@ -294,9 +307,8 @@ function normalizeConfig(payload) {
 
   return {
     url: config.url.trim(),
-    method: config.method || 'GET',
+    method: normalizedMethod,
     headers: finalHeaders,
-    json_body: config.json_body,
     requests: config.requests,
     concurrency: config.concurrency,
     duration: config.duration ?? 0,
